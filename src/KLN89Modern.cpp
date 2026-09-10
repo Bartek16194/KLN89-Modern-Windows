@@ -1,6 +1,7 @@
 #define UNICODE
 #define _UNICODE
 #include <windows.h>
+#include <windowsx.h>
 #include <shellapi.h>
 #include <commdlg.h>
 #include <filesystem>
@@ -23,6 +24,7 @@ static HGDIOBJ g_oldCapture = nullptr, g_oldBack = nullptr;
 static int g_backW = 0, g_backH = 0;
 static fs::path g_tempDir;
 static fs::path g_originalUserDat;
+static HWND g_mouseTarget = nullptr;
 
 static const wchar_t* APP_TITLE = L"KLN 89 Simulator - Modern Windows";
 
@@ -83,8 +85,7 @@ static bool PatchOriginal(const fs::path& src, const fs::path& dst, std::wstring
                 return false;
             }
         }
-        for (const auto& p : patches)
-            std::copy(p.to.begin(), p.to.end(), b.begin() + p.off);
+        for (const auto& p : patches) std::copy(p.to.begin(), p.to.end(), b.begin() + p.off);
     }
 
     fs::create_directories(dst.parent_path());
@@ -142,8 +143,7 @@ static void PersistUserDataAndCleanup() {
             if (!g_originalUserDat.empty() && fs::exists(tmpUser)) {
                 fs::copy_file(tmpUser, g_originalUserDat, fs::copy_options::overwrite_existing);
             }
-        } catch (...) {
-        }
+        } catch (...) {}
         std::error_code ec;
         fs::remove_all(g_tempDir, ec);
         g_tempDir.clear();
@@ -180,10 +180,9 @@ static void DestroyBuffers() {
 static bool EnsureBuffers(HWND hwnd, int cw, int ch) {
     HDC wnd = GetDC(hwnd);
     if (!wnd) return false;
-
     if (!g_captureDC) {
         g_captureDC = CreateCompatibleDC(wnd);
-        g_captureBmp = CreateCompatibleBitmap(wnd, std::max(1,g_srcW), std::max(1,g_srcH));
+        g_captureBmp = CreateCompatibleBitmap(wnd, (std::max)(1,g_srcW), (std::max)(1,g_srcH));
         g_oldCapture = SelectObject(g_captureDC, g_captureBmp);
     }
     if (!g_backDC || cw != g_backW || ch != g_backH) {
@@ -193,7 +192,7 @@ static bool EnsureBuffers(HWND hwnd, int cw, int ch) {
             DeleteDC(g_backDC);
         }
         g_backDC = CreateCompatibleDC(wnd);
-        g_backBmp = CreateCompatibleBitmap(wnd, std::max(1,cw), std::max(1,ch));
+        g_backBmp = CreateCompatibleBitmap(wnd, (std::max)(1,cw), (std::max)(1,ch));
         g_oldBack = SelectObject(g_backDC, g_backBmp);
         g_backW = cw; g_backH = ch;
     }
@@ -205,9 +204,9 @@ static void RecalcDestination(HWND hwnd) {
     RECT c{}; GetClientRect(hwnd, &c);
     int cw = c.right, ch = c.bottom;
     if (cw <= 0 || ch <= 0 || g_srcW <= 0 || g_srcH <= 0) return;
-    double s = std::min((double)cw / g_srcW, (double)ch / g_srcH);
-    int w = std::max(1, (int)(g_srcW * s + 0.5));
-    int h = std::max(1, (int)(g_srcH * s + 0.5));
+    double s = (std::min)((double)cw / g_srcW, (double)ch / g_srcH);
+    int w = (std::max)(1, (int)(g_srcW * s + 0.5));
+    int h = (std::max)(1, (int)(g_srcH * s + 0.5));
     g_dst.left = (cw - w) / 2;
     g_dst.top = (ch - h) / 2;
     g_dst.right = g_dst.left + w;
@@ -222,13 +221,48 @@ static bool ToCorePoint(int x, int y, POINT& out) {
     return true;
 }
 
+static HWND DeepestChildAtPoint(HWND parent, POINT parentClientPt, POINT& targetClientPt) {
+    HWND target = parent;
+    POINT pt = parentClientPt;
+    for (;;) {
+        HWND child = ChildWindowFromPointEx(target, pt, CWP_SKIPINVISIBLE | CWP_SKIPDISABLED | CWP_SKIPTRANSPARENT);
+        if (!child || child == target) break;
+        POINT screen = pt;
+        ClientToScreen(target, &screen);
+        ScreenToClient(child, &screen);
+        target = child;
+        pt = screen;
+    }
+    targetClientPt = pt;
+    return target;
+}
+
 static void ForwardMouse(UINT msg, WPARAM wp, LPARAM lp) {
     if (!g_core) return;
-    POINT p{};
+    POINT corePt{};
     int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
-    if (!ToCorePoint(x, y, p)) return;
-    LPARAM mapped = MAKELPARAM((SHORT)p.x, (SHORT)p.y);
-    PostMessageW(g_core, msg, wp, mapped);
+    if (!ToCorePoint(x, y, corePt)) return;
+
+    const bool isDown = (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN);
+    const bool isUp   = (msg == WM_LBUTTONUP || msg == WM_RBUTTONUP || msg == WM_MBUTTONUP);
+
+    HWND target = nullptr;
+    POINT targetPt{};
+    if ((isUp || msg == WM_MOUSEMOVE) && g_mouseTarget && IsWindow(g_mouseTarget)) {
+        target = g_mouseTarget;
+        POINT screen = corePt;
+        ClientToScreen(g_core, &screen);
+        ScreenToClient(target, &screen);
+        targetPt = screen;
+    } else {
+        target = DeepestChildAtPoint(g_core, corePt, targetPt);
+    }
+    if (!target) target = g_core;
+    if (isDown) g_mouseTarget = target;
+
+    LPARAM mapped = MAKELPARAM((SHORT)targetPt.x, (SHORT)targetPt.y);
+    SendMessageW(target, msg, wp, mapped);
+    if (isUp) g_mouseTarget = nullptr;
 }
 
 static void PaintScaled(HWND hwnd) {
@@ -244,10 +278,10 @@ static void PaintScaled(HWND hwnd) {
     RECT black{0,0,cw,ch};
     FillRect(g_backDC, &black, (HBRUSH)GetStockObject(BLACK_BRUSH));
 
-    BOOL ok = PrintWindow(g_core, g_captureDC, PW_CLIENTONLY);
-    if (!ok) {
-        HDC src = GetDC(g_core);
-        if (src) { BitBlt(g_captureDC, 0,0,g_srcW,g_srcH,src,0,0,SRCCOPY); ReleaseDC(g_core,src); }
+    HDC src = GetDC(g_core);
+    if (src) {
+        BitBlt(g_captureDC, 0, 0, g_srcW, g_srcH, src, 0, 0, SRCCOPY);
+        ReleaseDC(g_core, src);
     }
 
     RecalcDestination(hwnd);
@@ -293,7 +327,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, PWSTR, int) {
     CleanupOldTempDirs();
-
     Msg(L"Select your original kln89.exe in the next window.", MB_ICONINFORMATION);
     fs::path original;
     if (!ChooseOriginalExe(original)) return 0;
@@ -307,27 +340,18 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, PWSTR, int) {
     }
 
     g_tempDir = MakeUniqueTempDir();
-    if (g_tempDir.empty()) {
-        Msg(L"Could not create a temporary working folder.");
-        return 3;
-    }
+    if (g_tempDir.empty()) { Msg(L"Could not create a temporary working folder."); return 3; }
     g_originalUserDat = user;
 
     fs::path patched = g_tempDir / L"kln89_modern_core.exe";
     std::wstring why;
-    if (!PatchOriginal(original, patched, why)) {
-        CleanupOldTempDirs();
-        Msg(why);
-        return 4;
-    }
+    if (!PatchOriginal(original, patched, why)) { CleanupOldTempDirs(); Msg(why); return 4; }
 
     try {
         fs::copy_file(navdb, g_tempDir / L"c_navdb.dat", fs::copy_options::overwrite_existing);
-        fs::copy_file(user,  g_tempDir / L"user.dat",    fs::copy_options::overwrite_existing);
+        fs::copy_file(user, g_tempDir / L"user.dat", fs::copy_options::overwrite_existing);
     } catch (...) {
-        PersistUserDataAndCleanup();
-        Msg(L"Could not prepare the temporary working folder.");
-        return 5;
+        PersistUserDataAndCleanup(); Msg(L"Could not prepare the temporary working folder."); return 5;
     }
 
     std::wstring cmd = L"\"" + patched.wstring() + L"\"";
@@ -335,10 +359,8 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, PWSTR, int) {
     PROCESS_INFORMATION pi{};
     std::vector<wchar_t> cmdbuf(cmd.begin(), cmd.end()); cmdbuf.push_back(0);
     if (!CreateProcessW(patched.c_str(), cmdbuf.data(), nullptr, nullptr, FALSE, 0, nullptr, g_tempDir.c_str(), &si, &pi)) {
-        DWORD err = GetLastError();
-        PersistUserDataAndCleanup();
-        Msg(L"Failed to start patched KLN89 simulator.\nWindows error: " + std::to_wstring(err));
-        return 6;
+        DWORD err = GetLastError(); PersistUserDataAndCleanup();
+        Msg(L"Failed to start patched KLN89 simulator.\nWindows error: " + std::to_wstring(err)); return 6;
     }
     CloseHandle(pi.hThread); g_process = pi.hProcess; g_pid = pi.dwProcessId;
 
@@ -348,25 +370,17 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, PWSTR, int) {
     }
     if (!g_core) {
         Msg(L"KLN89 started, but its main window could not be found.");
-        TerminateProcess(g_process, 1);
-        WaitForSingleObject(g_process, 3000);
-        CloseHandle(g_process); g_process = nullptr;
-        PersistUserDataAndCleanup();
-        return 7;
+        TerminateProcess(g_process, 1); WaitForSingleObject(g_process, 3000); CloseHandle(g_process); g_process = nullptr;
+        PersistUserDataAndCleanup(); return 7;
     }
 
     RECT cr{}; GetClientRect(g_core, &cr); g_srcW = cr.right - cr.left; g_srcH = cr.bottom - cr.top;
     if (g_srcW < 100 || g_srcH < 100) {
-        Msg(L"Unexpected KLN89 client size.");
-        PostMessageW(g_core, WM_CLOSE, 0, 0);
-        WaitForSingleObject(g_process, 3000);
-        CloseHandle(g_process); g_process = nullptr;
-        PersistUserDataAndCleanup();
-        return 8;
+        Msg(L"Unexpected KLN89 client size."); PostMessageW(g_core, WM_CLOSE, 0, 0);
+        WaitForSingleObject(g_process, 3000); CloseHandle(g_process); g_process = nullptr; PersistUserDataAndCleanup(); return 8;
     }
 
-    SetWindowPos(g_core, nullptr, -32000, -32000, 0, 0,
-                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    SetWindowPos(g_core, nullptr, -32000, -32000, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
 
     WNDCLASSW wc{}; wc.lpfnWndProc = WndProc; wc.hInstance = hi; wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH); wc.lpszClassName = L"KLN89ModernWindow";
@@ -377,30 +391,21 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, PWSTR, int) {
     HWND hwnd = CreateWindowExW(0, wc.lpszClassName, APP_TITLE, WS_OVERLAPPEDWINDOW | WS_VISIBLE,
         CW_USEDEFAULT, CW_USEDEFAULT, wr.right - wr.left, wr.bottom - wr.top, nullptr, nullptr, hi, nullptr);
     if (!hwnd) {
-        Msg(L"Could not create scaler window.");
-        PostMessageW(g_core, WM_CLOSE, 0, 0);
-        WaitForSingleObject(g_process, 3000);
-        CloseHandle(g_process); g_process = nullptr;
-        PersistUserDataAndCleanup();
-        return 9;
+        Msg(L"Could not create scaler window."); PostMessageW(g_core, WM_CLOSE, 0, 0);
+        WaitForSingleObject(g_process, 3000); CloseHandle(g_process); g_process = nullptr; PersistUserDataAndCleanup(); return 9;
     }
-    SetTimer(hwnd, 1, 33, nullptr);
+    SetTimer(hwnd, 1, 50, nullptr);
     SetFocus(hwnd);
 
     MSG m{};
-    while (GetMessageW(&m, nullptr, 0, 0) > 0) {
-        TranslateMessage(&m);
-        DispatchMessageW(&m);
-    }
+    while (GetMessageW(&m, nullptr, 0, 0) > 0) { TranslateMessage(&m); DispatchMessageW(&m); }
 
     if (g_process) {
         DWORD state = WaitForSingleObject(g_process, 5000);
         if (state == WAIT_TIMEOUT && g_core && IsWindow(g_core)) {
-            PostMessageW(g_core, WM_CLOSE, 0, 0);
-            WaitForSingleObject(g_process, 3000);
+            PostMessageW(g_core, WM_CLOSE, 0, 0); WaitForSingleObject(g_process, 3000);
         }
-        CloseHandle(g_process);
-        g_process = nullptr;
+        CloseHandle(g_process); g_process = nullptr;
     }
     PersistUserDataAndCleanup();
     return (int)m.wParam;
