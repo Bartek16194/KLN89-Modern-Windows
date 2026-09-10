@@ -1,8 +1,9 @@
 #define UNICODE
 #define _UNICODE
+#define NOMINMAX
 #include <windows.h>
 #include <windowsx.h>
-#include <shellapi.h>
+#include <dwmapi.h>
 #include <commdlg.h>
 #include <filesystem>
 #include <fstream>
@@ -10,6 +11,7 @@
 #include <string>
 #include <algorithm>
 #include <cstdint>
+#include <cwchar>
 
 namespace fs = std::filesystem;
 
@@ -18,13 +20,19 @@ static HANDLE g_process = nullptr;
 static DWORD g_pid = 0;
 static int g_srcW = 0, g_srcH = 0;
 static RECT g_dst{};
+static fs::path g_tempDir;
+static fs::path g_originalUserDat;
+static HWND g_mouseTarget = nullptr;
+
+static HTHUMBNAIL g_thumbnail = nullptr;
+static bool g_useDwm = false;
+
+// Fallback renderer. On current Windows the DWM thumbnail path should be used,
+// so these buffers normally stay unused.
 static HDC g_captureDC = nullptr, g_backDC = nullptr;
 static HBITMAP g_captureBmp = nullptr, g_backBmp = nullptr;
 static HGDIOBJ g_oldCapture = nullptr, g_oldBack = nullptr;
 static int g_backW = 0, g_backH = 0;
-static fs::path g_tempDir;
-static fs::path g_originalUserDat;
-static HWND g_mouseTarget = nullptr;
 
 static const wchar_t* APP_TITLE = L"KLN 89 Simulator - Modern Windows";
 
@@ -67,7 +75,8 @@ static bool PatchOriginal(const fs::path& src, const fs::path& dst, std::wstring
 
     bool already = true;
     for (const auto& p : patches) {
-        if (p.off + p.to.size() > b.size() || !std::equal(p.to.begin(), p.to.end(), b.begin() + p.off)) {
+        if (p.off + p.to.size() > b.size() ||
+            !std::equal(p.to.begin(), p.to.end(), b.begin() + p.off)) {
             already = false;
             break;
         }
@@ -75,7 +84,8 @@ static bool PatchOriginal(const fs::path& src, const fs::path& dst, std::wstring
 
     if (!already) {
         for (const auto& p : patches) {
-            if (p.off + p.from.size() > b.size() || !std::equal(p.from.begin(), p.from.end(), b.begin() + p.off)) {
+            if (p.off + p.from.size() > b.size() ||
+                !std::equal(p.from.begin(), p.from.end(), b.begin() + p.off)) {
                 why = L"This kln89.exe is not the known 1997 build, or it was modified already.\nNo patch was applied.";
                 return false;
             }
@@ -97,7 +107,10 @@ static bool ChooseOriginalExe(fs::path& out) {
     OPENFILENAMEW ofn{};
     ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner = nullptr;
-    ofn.lpstrFilter = L"KLN 89 Simulator (kln89.exe)\0kln89.exe\0Executable files (*.exe)\0*.exe\0All files (*.*)\0*.*\0\0";
+    ofn.lpstrFilter =
+        L"KLN 89 Simulator (kln89.exe)\0kln89.exe\0"
+        L"Executable files (*.exe)\0*.exe\0"
+        L"All files (*.*)\0*.*\0\0";
     ofn.lpstrFile = fileBuf;
     ofn.nMaxFile = (DWORD)std::size(fileBuf);
     ofn.lpstrTitle = L"Select your original kln89.exe";
@@ -112,22 +125,46 @@ static fs::path MakeUniqueTempDir() {
     DWORD pid = GetCurrentProcessId();
     ULONGLONG tick = GetTickCount64();
     for (unsigned i = 0; i < 1000; ++i) {
-        fs::path p = base / (L"KLN89Modern_" + std::to_wstring(pid) + L"_" + std::to_wstring(tick) + L"_" + std::to_wstring(i));
+        fs::path p = base / (L"KLN89Modern_" + std::to_wstring(pid) + L"_" +
+                             std::to_wstring(tick) + L"_" + std::to_wstring(i));
         std::error_code ec;
         if (fs::create_directory(p, ec)) return p;
     }
     return {};
 }
 
+static bool IsProcessAlive(DWORD pid) {
+    if (!pid) return false;
+    HANDLE h = OpenProcess(SYNCHRONIZE, FALSE, pid);
+    if (!h) return false;
+    DWORD state = WaitForSingleObject(h, 0);
+    CloseHandle(h);
+    return state == WAIT_TIMEOUT;
+}
+
 static void CleanupOldTempDirs() {
     std::error_code ec;
     fs::path base = fs::temp_directory_path(ec);
     if (ec) return;
+
+    const std::wstring prefix = L"KLN89Modern_";
     for (auto it = fs::directory_iterator(base, fs::directory_options::skip_permission_denied, ec);
          !ec && it != fs::directory_iterator(); it.increment(ec)) {
         if (!it->is_directory(ec)) continue;
-        auto name = it->path().filename().wstring();
-        if (name.rfind(L"KLN89Modern_", 0) != 0) continue;
+        std::wstring name = it->path().filename().wstring();
+        if (name.rfind(prefix, 0) != 0) continue;
+
+        // Folder name starts with KLN89Modern_<wrapper PID>_. Never delete a
+        // folder belonging to another wrapper that is still running.
+        size_t pidBegin = prefix.size();
+        size_t pidEnd = name.find(L'_', pidBegin);
+        DWORD ownerPid = 0;
+        if (pidEnd != std::wstring::npos) {
+            std::wstring pidText = name.substr(pidBegin, pidEnd - pidBegin);
+            ownerPid = (DWORD)std::wcstoul(pidText.c_str(), nullptr, 10);
+        }
+        if (ownerPid && IsProcessAlive(ownerPid)) continue;
+
         fs::remove_all(it->path(), ec);
         ec.clear();
     }
@@ -135,6 +172,7 @@ static void CleanupOldTempDirs() {
 
 static void PersistUserDataAndCleanup() {
     if (g_tempDir.empty()) return;
+
     try {
         fs::path tmpUser = g_tempDir / L"user.dat";
         if (!g_originalUserDat.empty() && fs::exists(tmpUser))
@@ -156,7 +194,54 @@ static BOOL CALLBACK FindWindowForPid(HWND h, LPARAM lp) {
     return TRUE;
 }
 
-static void DestroyBuffers() {
+static void RecalcDestination(HWND hwnd) {
+    RECT c{};
+    GetClientRect(hwnd, &c);
+    int cw = c.right;
+    int ch = c.bottom;
+    if (cw <= 0 || ch <= 0 || g_srcW <= 0 || g_srcH <= 0) return;
+
+    double scale = (std::min)((double)cw / g_srcW, (double)ch / g_srcH);
+    int w = (std::max)(1, (int)(g_srcW * scale + 0.5));
+    int h = (std::max)(1, (int)(g_srcH * scale + 0.5));
+
+    g_dst.left = (cw - w) / 2;
+    g_dst.top = (ch - h) / 2;
+    g_dst.right = g_dst.left + w;
+    g_dst.bottom = g_dst.top + h;
+}
+
+static void UpdateDwmThumbnail(HWND hwnd) {
+    if (!g_useDwm || !g_thumbnail) return;
+
+    RecalcDestination(hwnd);
+
+    DWM_THUMBNAIL_PROPERTIES props{};
+    props.dwFlags = DWM_TNP_RECTDESTINATION |
+                    DWM_TNP_VISIBLE |
+                    DWM_TNP_OPACITY |
+                    DWM_TNP_SOURCECLIENTAREAONLY;
+    props.rcDestination = g_dst;
+    props.opacity = 255;
+    props.fVisible = TRUE;
+    props.fSourceClientAreaOnly = TRUE;
+    DwmUpdateThumbnailProperties(g_thumbnail, &props);
+}
+
+static bool InitDwmThumbnail(HWND hwnd) {
+    BOOL composition = FALSE;
+    if (FAILED(DwmIsCompositionEnabled(&composition)) || !composition)
+        return false;
+
+    if (FAILED(DwmRegisterThumbnail(hwnd, g_core, &g_thumbnail)) || !g_thumbnail)
+        return false;
+
+    g_useDwm = true;
+    UpdateDwmThumbnail(hwnd);
+    return true;
+}
+
+static void DestroyFallbackBuffers() {
     if (g_captureDC) {
         if (g_oldCapture) SelectObject(g_captureDC, g_oldCapture);
         if (g_captureBmp) DeleteObject(g_captureBmp);
@@ -167,20 +252,22 @@ static void DestroyBuffers() {
         if (g_backBmp) DeleteObject(g_backBmp);
         DeleteDC(g_backDC);
     }
+
     g_captureDC = g_backDC = nullptr;
     g_captureBmp = g_backBmp = nullptr;
     g_oldCapture = g_oldBack = nullptr;
     g_backW = g_backH = 0;
 }
 
-static bool EnsureBuffers(HWND hwnd, int cw, int ch) {
+static bool EnsureFallbackBuffers(HWND hwnd, int cw, int ch) {
     HDC wnd = GetDC(hwnd);
     if (!wnd) return false;
 
     if (!g_captureDC) {
         g_captureDC = CreateCompatibleDC(wnd);
         g_captureBmp = CreateCompatibleBitmap(wnd, (std::max)(1, g_srcW), (std::max)(1, g_srcH));
-        g_oldCapture = SelectObject(g_captureDC, g_captureBmp);
+        if (g_captureDC && g_captureBmp)
+            g_oldCapture = SelectObject(g_captureDC, g_captureBmp);
     }
 
     if (!g_backDC || cw != g_backW || ch != g_backH) {
@@ -191,35 +278,23 @@ static bool EnsureBuffers(HWND hwnd, int cw, int ch) {
         }
         g_backDC = CreateCompatibleDC(wnd);
         g_backBmp = CreateCompatibleBitmap(wnd, (std::max)(1, cw), (std::max)(1, ch));
-        g_oldBack = SelectObject(g_backDC, g_backBmp);
+        if (g_backDC && g_backBmp)
+            g_oldBack = SelectObject(g_backDC, g_backBmp);
         g_backW = cw;
         g_backH = ch;
     }
 
     ReleaseDC(hwnd, wnd);
-    return g_captureDC && g_backDC;
-}
-
-static void RecalcDestination(HWND hwnd) {
-    RECT c{};
-    GetClientRect(hwnd, &c);
-    int cw = c.right, ch = c.bottom;
-    if (cw <= 0 || ch <= 0 || g_srcW <= 0 || g_srcH <= 0) return;
-
-    double s = (std::min)((double)cw / g_srcW, (double)ch / g_srcH);
-    int w = (std::max)(1, (int)(g_srcW * s + 0.5));
-    int h = (std::max)(1, (int)(g_srcH * s + 0.5));
-    g_dst.left = (cw - w) / 2;
-    g_dst.top = (ch - h) / 2;
-    g_dst.right = g_dst.left + w;
-    g_dst.bottom = g_dst.top + h;
+    return g_captureDC && g_captureBmp && g_backDC && g_backBmp;
 }
 
 static bool ToCorePoint(int x, int y, POINT& out) {
     int dw = g_dst.right - g_dst.left;
     int dh = g_dst.bottom - g_dst.top;
-    if (dw <= 0 || dh <= 0 || x < g_dst.left || x >= g_dst.right || y < g_dst.top || y >= g_dst.bottom)
+    if (dw <= 0 || dh <= 0 ||
+        x < g_dst.left || x >= g_dst.right || y < g_dst.top || y >= g_dst.bottom)
         return false;
+
     out.x = (x - g_dst.left) * g_srcW / dw;
     out.y = (y - g_dst.top) * g_srcH / dh;
     return true;
@@ -230,8 +305,8 @@ static HWND DeepestChildAtPoint(HWND parent, POINT parentClientPt, POINT& target
     POINT pt = parentClientPt;
 
     for (;;) {
-        HWND child = ChildWindowFromPointEx(target, pt,
-            CWP_SKIPINVISIBLE | CWP_SKIPDISABLED | CWP_SKIPTRANSPARENT);
+        HWND child = ChildWindowFromPointEx(
+            target, pt, CWP_SKIPINVISIBLE | CWP_SKIPDISABLED | CWP_SKIPTRANSPARENT);
         if (!child || child == target) break;
 
         POINT screen = pt;
@@ -249,12 +324,12 @@ static void ForwardMouse(UINT msg, WPARAM wp, LPARAM lp) {
     if (!g_core) return;
 
     POINT corePt{};
-    int x = GET_X_LPARAM(lp);
-    int y = GET_Y_LPARAM(lp);
-    if (!ToCorePoint(x, y, corePt)) return;
+    if (!ToCorePoint(GET_X_LPARAM(lp), GET_Y_LPARAM(lp), corePt)) return;
 
-    const bool isDown = (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN);
-    const bool isUp   = (msg == WM_LBUTTONUP || msg == WM_RBUTTONUP || msg == WM_MBUTTONUP);
+    const bool isDown =
+        msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN;
+    const bool isUp =
+        msg == WM_LBUTTONUP || msg == WM_RBUTTONUP || msg == WM_MBUTTONUP;
 
     HWND target = nullptr;
     POINT targetPt{};
@@ -278,79 +353,72 @@ static void ForwardMouse(UINT msg, WPARAM wp, LPARAM lp) {
     if (isUp) g_mouseTarget = nullptr;
 }
 
-static bool CaptureCore() {
-    if (!g_core || !g_captureDC) return false;
-
-    RECT r{0, 0, g_srcW, g_srcH};
-    FillRect(g_captureDC, &r, (HBRUSH)GetStockObject(BLACK_BRUSH));
-
-    // WM_PRINT asks the legacy window to draw directly into our memory DC.
-    // Unlike PrintWindow(), this avoids the extra compositor/window-capture path
-    // that was causing visible flashing on some modern Windows systems.
-    DWORD_PTR ignored = 0;
-    LRESULT sent = SendMessageTimeoutW(
-        g_core,
-        WM_PRINT,
-        (WPARAM)g_captureDC,
-        PRF_CLIENT | PRF_CHILDREN | PRF_ERASEBKGND | PRF_OWNED,
-        SMTO_ABORTIFHUNG | SMTO_BLOCK,
-        100,
-        &ignored);
-
-    if (sent != 0)
-        return true;
-
-    // Fallback for systems/builds where WM_PRINT is not honored.
-    return PrintWindow(g_core, g_captureDC, PW_CLIENTONLY) != FALSE;
-}
-
-static void PaintScaled(HWND hwnd) {
-    PAINTSTRUCT ps{};
-    HDC dc = BeginPaint(hwnd, &ps);
-    RECT c{};
-    GetClientRect(hwnd, &c);
-    int cw = c.right, ch = c.bottom;
-
-    if (cw <= 0 || ch <= 0 || !g_core || !EnsureBuffers(hwnd, cw, ch)) {
-        FillRect(dc, &c, (HBRUSH)GetStockObject(BLACK_BRUSH));
-        EndPaint(hwnd, &ps);
-        return;
-    }
+static void PaintFallback(HWND hwnd, HDC dc, int cw, int ch) {
+    if (!EnsureFallbackBuffers(hwnd, cw, ch)) return;
 
     RECT black{0, 0, cw, ch};
     FillRect(g_backDC, &black, (HBRUSH)GetStockObject(BLACK_BRUSH));
 
-    CaptureCore();
+    // Only used when DWM thumbnails are unavailable.
+    BOOL captured = PrintWindow(g_core, g_captureDC, PW_CLIENTONLY);
+    if (!captured) {
+        HDC src = GetDC(g_core);
+        if (src) {
+            BitBlt(g_captureDC, 0, 0, g_srcW, g_srcH, src, 0, 0, SRCCOPY);
+            ReleaseDC(g_core, src);
+        }
+    }
 
     RecalcDestination(hwnd);
     SetStretchBltMode(g_backDC, COLORONCOLOR);
     StretchBlt(g_backDC,
-        g_dst.left, g_dst.top,
-        g_dst.right - g_dst.left, g_dst.bottom - g_dst.top,
-        g_captureDC, 0, 0, g_srcW, g_srcH, SRCCOPY);
+               g_dst.left, g_dst.top,
+               g_dst.right - g_dst.left, g_dst.bottom - g_dst.top,
+               g_captureDC, 0, 0, g_srcW, g_srcH, SRCCOPY);
     BitBlt(dc, 0, 0, cw, ch, g_backDC, 0, 0, SRCCOPY);
-
-    EndPaint(hwnd, &ps);
 }
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_ERASEBKGND:
         return 1;
+
     case WM_SIZE:
         RecalcDestination(hwnd);
-        InvalidateRect(hwnd, nullptr, FALSE);
+        if (g_useDwm) {
+            UpdateDwmThumbnail(hwnd);
+            InvalidateRect(hwnd, nullptr, FALSE);
+        } else {
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
         return 0;
+
     case WM_TIMER:
         if (g_process && WaitForSingleObject(g_process, 0) == WAIT_OBJECT_0) {
             PostMessageW(hwnd, WM_CLOSE, 0, 0);
             return 0;
         }
-        InvalidateRect(hwnd, nullptr, FALSE);
+        // DWM updates the live thumbnail itself. Never repaint it on a timer.
+        if (!g_useDwm)
+            InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
-    case WM_PAINT:
-        PaintScaled(hwnd);
+
+    case WM_PAINT: {
+        PAINTSTRUCT ps{};
+        HDC dc = BeginPaint(hwnd, &ps);
+        RECT c{};
+        GetClientRect(hwnd, &c);
+        int cw = c.right;
+        int ch = c.bottom;
+
+        FillRect(dc, &c, (HBRUSH)GetStockObject(BLACK_BRUSH));
+        if (!g_useDwm && cw > 0 && ch > 0 && g_core)
+            PaintFallback(hwnd, dc, cw, ch);
+
+        EndPaint(hwnd, &ps);
         return 0;
+    }
+
     case WM_LBUTTONDOWN:
         SetCapture(hwnd); SetFocus(hwnd); ForwardMouse(msg, wp, lp); return 0;
     case WM_LBUTTONUP:
@@ -365,6 +433,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         ForwardMouse(msg, wp, lp); ReleaseCapture(); return 0;
     case WM_MOUSEMOVE:
         ForwardMouse(msg, wp, lp); return 0;
+
     case WM_MOUSEWHEEL:
         if (g_core) {
             POINT p{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
@@ -376,6 +445,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
         }
         return 0;
+
     case WM_KEYDOWN:
     case WM_KEYUP:
     case WM_CHAR:
@@ -383,16 +453,25 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_SYSKEYUP:
         if (g_core) PostMessageW(g_core, msg, wp, lp);
         return 0;
+
     case WM_CLOSE:
-        if (g_core && IsWindow(g_core)) PostMessageW(g_core, WM_CLOSE, 0, 0);
+        if (g_core && IsWindow(g_core))
+            PostMessageW(g_core, WM_CLOSE, 0, 0);
         DestroyWindow(hwnd);
         return 0;
+
     case WM_DESTROY:
         KillTimer(hwnd, 1);
-        DestroyBuffers();
+        if (g_thumbnail) {
+            DwmUnregisterThumbnail(g_thumbnail);
+            g_thumbnail = nullptr;
+        }
+        g_useDwm = false;
+        DestroyFallbackBuffers();
         PostQuitMessage(0);
         return 0;
     }
+
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
@@ -421,7 +500,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, PWSTR, int) {
     fs::path patched = g_tempDir / L"kln89_modern_core.exe";
     std::wstring why;
     if (!PatchOriginal(original, patched, why)) {
-        CleanupOldTempDirs();
+        PersistUserDataAndCleanup();
         Msg(why);
         return 4;
     }
@@ -484,9 +563,6 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, PWSTR, int) {
         return 8;
     }
 
-    SetWindowPos(g_core, nullptr, -32000, -32000, 0, 0,
-                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
-
     WNDCLASSW wc{};
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hi;
@@ -500,7 +576,8 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, PWSTR, int) {
     RECT wr{0, 0, initW, initH};
     AdjustWindowRect(&wr, WS_OVERLAPPEDWINDOW, FALSE);
 
-    HWND hwnd = CreateWindowExW(0, wc.lpszClassName, APP_TITLE,
+    HWND hwnd = CreateWindowExW(
+        0, wc.lpszClassName, APP_TITLE,
         WS_OVERLAPPEDWINDOW | WS_VISIBLE,
         CW_USEDEFAULT, CW_USEDEFAULT,
         wr.right - wr.left, wr.bottom - wr.top,
@@ -516,7 +593,23 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, PWSTR, int) {
         return 9;
     }
 
-    SetTimer(hwnd, 1, 50, nullptr);
+    RecalcDestination(hwnd);
+    InitDwmThumbnail(hwnd);
+
+    // Keep the real legacy window alive and visible to DWM, but park it beyond
+    // the virtual desktop so the user only sees the modern wrapper.
+    int offX = GetSystemMetrics(SM_XVIRTUALSCREEN) - g_srcW - 500;
+    int offY = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    SetWindowPos(g_core, nullptr, offX, offY, 0, 0,
+                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+
+    if (g_useDwm)
+        UpdateDwmThumbnail(hwnd);
+
+    // Only checks whether the legacy process exited. DWM itself refreshes the
+    // image, so there is no frame-grabbing/repaint loop and therefore no
+    // capture-induced flashing.
+    SetTimer(hwnd, 1, g_useDwm ? 250 : 50, nullptr);
     SetFocus(hwnd);
 
     MSG m{};
