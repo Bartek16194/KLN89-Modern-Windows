@@ -278,6 +278,32 @@ static void ForwardMouse(UINT msg, WPARAM wp, LPARAM lp) {
     if (isUp) g_mouseTarget = nullptr;
 }
 
+static bool CaptureCore() {
+    if (!g_core || !g_captureDC) return false;
+
+    RECT r{0, 0, g_srcW, g_srcH};
+    FillRect(g_captureDC, &r, (HBRUSH)GetStockObject(BLACK_BRUSH));
+
+    // WM_PRINT asks the legacy window to draw directly into our memory DC.
+    // Unlike PrintWindow(), this avoids the extra compositor/window-capture path
+    // that was causing visible flashing on some modern Windows systems.
+    DWORD_PTR ignored = 0;
+    LRESULT sent = SendMessageTimeoutW(
+        g_core,
+        WM_PRINT,
+        (WPARAM)g_captureDC,
+        PRF_CLIENT | PRF_CHILDREN | PRF_ERASEBKGND | PRF_OWNED,
+        SMTO_ABORTIFHUNG | SMTO_BLOCK,
+        100,
+        &ignored);
+
+    if (sent != 0)
+        return true;
+
+    // Fallback for systems/builds where WM_PRINT is not honored.
+    return PrintWindow(g_core, g_captureDC, PW_CLIENTONLY) != FALSE;
+}
+
 static void PaintScaled(HWND hwnd) {
     PAINTSTRUCT ps{};
     HDC dc = BeginPaint(hwnd, &ps);
@@ -294,17 +320,7 @@ static void PaintScaled(HWND hwnd) {
     RECT black{0, 0, cw, ch};
     FillRect(g_backDC, &black, (HBRUSH)GetStockObject(BLACK_BRUSH));
 
-    // The legacy KLN89 UI mixes parent-painted content with child controls.
-    // PrintWindow is required here; a plain BitBlt of the parent DC omits
-    // important owner-drawn/child content such as the LCD and many controls.
-    BOOL captured = PrintWindow(g_core, g_captureDC, PW_CLIENTONLY);
-    if (!captured) {
-        HDC src = GetDC(g_core);
-        if (src) {
-            BitBlt(g_captureDC, 0, 0, g_srcW, g_srcH, src, 0, 0, SRCCOPY);
-            ReleaseDC(g_core, src);
-        }
-    }
+    CaptureCore();
 
     RecalcDestination(hwnd);
     SetStretchBltMode(g_backDC, COLORONCOLOR);
