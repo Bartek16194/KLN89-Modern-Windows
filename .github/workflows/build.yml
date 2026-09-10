@@ -1,0 +1,23 @@
+name: Build
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: Build KLN89Modern.exe
+        shell: cmd
+        run: >-
+          cl /nologo /std:c++17 /O2 /EHsc /DUNICODE /D_UNICODE src\KLN89Modern.cpp
+          /link user32.lib gdi32.lib shell32.lib comdlg32.lib /SUBSYSTEM:WINDOWS /OUT:KLN89Modern.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: KLN89Modern-Windows-x64
+          path: KLN89Modern.exe
