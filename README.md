@@ -1,5 +1,7 @@
 # KLN 89 Simulator - Modern Windows Compatibility Wrapper
 
+<img width="1073" height="399" alt="image" src="https://github.com/user-attachments/assets/27bdce4e-73fc-461f-8d67-1979286b46e4" />
+
 Unofficial community compatibility wrapper for the legacy **Bendix/King / AlliedSignal KLN 89/89B simulator** on modern Windows.
 
 The original simulator is **not included** in this repository or in release binaries. This project contains only the compatibility wrapper and patching code.
@@ -48,11 +50,6 @@ The original executable is never modified. KLN89Modern creates a patched working
 - Uses buffered/cached rendering to greatly reduce flicker from the legacy Win32/GDI interface.
 
 A very occasional single-frame flicker may still occur on some systems because of the way the original 1997 application renders its interface.
-
-## Screenshot
-
-<!-- Upload your screenshot as docs/screenshot.png, then uncomment the line below. -->
-<!-- ![KLN89 Modern Windows](docs/screenshot.png) -->
 
 ## Supported original executable
 
