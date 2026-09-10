@@ -1,0 +1,15 @@
+# Original simulator files - never commit these
+kln89.exe
+kln89.hlp
+c_navdb.dat
+user.dat
+Setup.inf
+setuplog.txt
+
+# Build outputs
+*.obj
+*.pdb
+*.ilk
+*.exe
+build/
+.vs/
