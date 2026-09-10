@@ -60,18 +60,6 @@ The patcher currently targets the known 1997 executable:
 
 The program verifies the expected machine-code bytes before patching. If the executable differs, it stops instead of modifying an unknown build.
 
-## Building from source
-
-A GitHub Actions workflow automatically builds the Windows executable.
-
-To build locally, open a **Developer Command Prompt for Visual Studio** and run:
-
-```bat
-cl /std:c++17 /O2 /EHsc src\KLN89Modern.cpp /link user32.lib gdi32.lib comdlg32.lib /SUBSYSTEM:WINDOWS /OUT:KLN89Modern.exe
-```
-
-Normal users do **not** need to build the project themselves; use the ready-made executable from Releases.
-
 ## Legal / trademark notice
 
 This project is an **unofficial compatibility modification** and is not affiliated with, sponsored by, or endorsed by Bendix/King, AlliedSignal, Honeywell, Software Informer, or any successor rights holder.
