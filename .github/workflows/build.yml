@@ -13,10 +13,13 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
 
-      - uses: ilammy/msvc-dev-cmd@v1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
 
@@ -32,7 +35,7 @@ jobs:
           name: KLN89Modern-Windows-x64
           path: KLN89Modern.exe
 
-      - name: Create GitHub Release from tag
+      - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         shell: pwsh
         env:
@@ -40,16 +43,4 @@ jobs:
         run: |
           gh release create "${{ github.ref_name }}" .\KLN89Modern.exe `
             --title "KLN89 Modern Windows ${{ github.ref_name }}" `
-            --generate-notes
-
-      - name: Create GitHub Release from release commit
-        if: github.ref == 'refs/heads/main' && startsWith(github.event.head_commit.message, 'Release v')
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          $version = "${{ github.event.head_commit.message }}" -replace '^Release\s+', ''
-          gh release create "$version" .\KLN89Modern.exe `
-            --target "${{ github.sha }}" `
-            --title "KLN89 Modern Windows $version" `
             --generate-notes
