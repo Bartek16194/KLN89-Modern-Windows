@@ -1,23 +1,43 @@
-name: Build
+name: Build and Release
 
 on:
   push:
     branches: [ "main" ]
+    tags: [ "v*" ]
   pull_request:
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
       - name: Build KLN89Modern.exe
         shell: cmd
         run: >-
-          cl /nologo /std:c++17 /O2 /EHsc /DUNICODE /D_UNICODE src\KLN89Modern.cpp
+          cl /nologo /std:c++17 /O2 /EHsc /DNOMINMAX /FIwindowsx.h src\KLN89Modern.cpp
           /link user32.lib gdi32.lib shell32.lib comdlg32.lib /SUBSYSTEM:WINDOWS /OUT:KLN89Modern.exe
-      - uses: actions/upload-artifact@v4
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
         with:
           name: KLN89Modern-Windows-x64
           path: KLN89Modern.exe
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" .\KLN89Modern.exe `
+            --title "KLN89 Modern Windows ${{ github.ref_name }}" `
+            --generate-notes
